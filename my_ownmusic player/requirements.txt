@@ -1,0 +1,6 @@
+PyQt6
+pygame
+pillow
+numpy
+mutagen
+requests

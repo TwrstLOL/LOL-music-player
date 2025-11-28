@@ -25,13 +25,22 @@ except ImportError:
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout, QHBoxLayout,
     QLabel, QFileDialog, QListWidget, QSlider, QMessageBox, QFrame,
-    QSpacerItem, QSizePolicy, QGraphicsDropShadowEffect, QLineEdit, QMenu, QAbstractItemView
+    QSpacerItem, QSizePolicy, QGraphicsDropShadowEffect, QLineEdit, QMenu, QAbstractItemView,
+    QDialog, QListWidgetItem, QProgressDialog, QInputDialog
 )
 from PyQt6.QtGui import (
     QPainter, QColor, QFont, QPixmap, QAction, QLinearGradient, 
     QBrush, QPen, QPainterPath, QRadialGradient
 )
+from PyQt6.QtGui import QIcon, QKeySequence
 from PyQt6.QtCore import Qt, QTimer, QPoint, QRectF, QSize, pyqtSignal, QObject, QPropertyAnimation
+import threading
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except Exception:
+    REQUESTS_AVAILABLE = False
 
 # Initialize pygame mixer
 pygame.mixer.init()
@@ -149,6 +158,212 @@ class AdvancedVisualizer(QWidget):
         
         painter.setBrush(QBrush(grad))
         painter.setPen(Qt.PenStyle.NoPen)
+
+        # Peak pen
+        peak_pen = QPen(QColor(255, 100, 100, 200))
+        peak_pen.setWidth(2)
+
+        # Mirror Logic:
+        # We actually calculate 32 bars, then draw them left and right of center
+        half_bars = self.bars // 2
+
+        for i in range(half_bars):
+            # Bass is usually at index 0, highs at index 32
+            # We want Bass in the center
+            val_idx = i 
+            
+            val = max(0.02, self.values[val_idx])
+            peak = max(0.02, self.peaks[val_idx])
+            
+            bar_h = val * h * 0.8
+            peak_y = h - (peak * h * 0.8)
+            
+            # Left side
+            x_left = center_x - ((i + 1) * (bar_w + spacing))
+            # Right side
+            x_right = center_x + (i * (bar_w + spacing))
+            
+            # Draw Bars
+            # Rounded caps look more "iOS"
+            path_l = QPainterPath()
+            path_l.addRoundedRect(x_left, h - bar_h, bar_w, bar_h, 4, 4)
+            painter.drawPath(path_l)
+            
+            path_r = QPainterPath()
+            path_r.addRoundedRect(x_right, h - bar_h, bar_w, bar_h, 4, 4)
+            painter.drawPath(path_r)
+            
+            # Draw Peaks (floating dashes)
+            painter.setPen(peak_pen)
+            painter.drawLine(int(x_left), int(peak_y), int(x_left + bar_w), int(peak_y))
+            painter.drawLine(int(x_right), int(peak_y), int(x_right + bar_w), int(peak_y))
+            
+            painter.setPen(Qt.PenStyle.NoPen)
+
+class MarketplaceDialog(QDialog):
+    """Simple marketplace dialog showing a few sample free tracks and allowing download.
+    Downloads are performed in a background thread and can be imported into the main playlist.
+    """
+    def __init__(self, parent=None, on_download=None):
+        super().__init__(parent)
+        self.on_download = on_download
+        self.setWindowTitle("Marketplace")
+        self.resize(600, 400)
+
+        layout = QVBoxLayout(self)
+
+        self.store_list = QListWidget()
+        layout.addWidget(self.store_list)
+
+        btn_row = QHBoxLayout()
+        self.btn_download = QPushButton("Download")
+        self.btn_import_url = QPushButton("Import from URL")
+        self.btn_close = QPushButton("Close")
+        btn_row.addWidget(self.btn_download)
+        btn_row.addWidget(self.btn_import_url)
+        btn_row.addStretch()
+        btn_row.addWidget(self.btn_close)
+        layout.addLayout(btn_row)
+
+        # Sample items (public sample MP3s). Only include samples meant for testing.
+        samples = [
+            {"title": "Sample 1", "artist": "SoundHelix", "url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"},
+            {"title": "Sample 2", "artist": "SoundHelix", "url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3"},
+            {"title": "Sample 3", "artist": "SoundHelix", "url": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3"},
+        ]
+
+        for s in samples:
+            it = QListWidgetItem(f"{s['title']} — {s['artist']}")
+            it.setData(Qt.ItemDataRole.UserRole, s)
+            self.store_list.addItem(it)
+
+        self.btn_download.clicked.connect(self._download_selected)
+        self.btn_import_url.clicked.connect(self._import_from_url)
+        self.btn_close.clicked.connect(self.accept)
+
+        # Signals object for progress updates
+        class _DLSignals(QObject):
+            progress = pyqtSignal(int)
+            finished = pyqtSignal(str)
+            error = pyqtSignal(str)
+
+        self._signals = _DLSignals()
+
+    def _download_selected(self):
+        if not REQUESTS_AVAILABLE:
+            QMessageBox.warning(self, "Requests missing", "The 'requests' package is required to download. Install it with: pip install requests")
+            return
+
+        it = self.store_list.currentItem()
+        if not it:
+            QMessageBox.information(self, "No selection", "Please select a track to download.")
+            return
+        meta = it.data(Qt.ItemDataRole.UserRole)
+        url = meta.get('url')
+        suggested = meta.get('title', 'download') + Path(url).suffix
+        dest, _ = QFileDialog.getSaveFileName(self, "Save track as", suggested, "Audio (*.mp3 *.wav *.ogg)")
+        if not dest:
+            return
+
+        progress = QProgressDialog("Downloading…", "Cancel", 0, 100, self)
+        progress.setWindowTitle("Downloading")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+
+        def on_progress(val):
+            progress.setValue(val)
+
+        def on_finished(path):
+            progress.setValue(100)
+            QMessageBox.information(self, "Downloaded", f"Saved to: {path}")
+            if callable(self.on_download):
+                self.on_download(path, True)
+
+        def on_error(msg):
+            QMessageBox.critical(self, "Download error", msg)
+
+        self._signals.progress.connect(on_progress)
+        self._signals.finished.connect(on_finished)
+        self._signals.error.connect(on_error)
+
+        def worker():
+            try:
+                r = requests.get(url, stream=True, timeout=15)
+                r.raise_for_status()
+                total = r.headers.get('content-length')
+                if total is None:
+                    # unknown size
+                    with open(dest, 'wb') as fh:
+                        fh.write(r.content)
+                    self._signals.progress.emit(100)
+                    self._signals.finished.emit(dest)
+                    return
+
+                total = int(total)
+                written = 0
+                chunk_size = 8192
+                with open(dest, 'wb') as fh:
+                    for chunk in r.iter_content(chunk_size=chunk_size):
+                        if not chunk:
+                            continue
+                        fh.write(chunk)
+                        written += len(chunk)
+                        pct = int((written / total) * 100)
+                        self._signals.progress.emit(pct)
+                self._signals.finished.emit(dest)
+            except Exception as e:
+                self._signals.error.emit(str(e))
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+
+    def _import_from_url(self):
+        if not REQUESTS_AVAILABLE:
+            QMessageBox.warning(self, "Requests missing", "The 'requests' package is required to download. Install it with: pip install requests")
+            return
+
+        url, ok = QInputDialog.getText(self, "Import from URL", "Enter direct audio file URL:")
+        if not ok or not url:
+            return
+        # Ask where to save
+        suggested = Path(url).name or 'download.mp3'
+        dest, _ = QFileDialog.getSaveFileName(self, "Save track as", suggested, "Audio (*.mp3 *.wav *.ogg)")
+        if not dest:
+            return
+        # Reuse download logic by adding a temporary item and invoking worker
+        # Show simple progress dialog
+        progress = QProgressDialog("Downloading…", "Cancel", 0, 0, self)
+        progress.setWindowTitle("Downloading")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+
+        def worker():
+            try:
+                r = requests.get(url, stream=True, timeout=15)
+                r.raise_for_status()
+                with open(dest, 'wb') as fh:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            fh.write(chunk)
+                self._signals.finished.emit(dest)
+            except Exception as e:
+                self._signals.error.emit(str(e))
+
+        def on_finished(path):
+            progress.close()
+            QMessageBox.information(self, "Downloaded", f"Saved to: {path}")
+            if callable(self.on_download):
+                self.on_download(path, True)
+
+        def on_error(msg):
+            progress.close()
+            QMessageBox.critical(self, "Download error", msg)
+
+        self._signals.finished.connect(on_finished)
+        self._signals.error.connect(on_error)
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
         
         # Peak pen
         peak_pen = QPen(QColor(255, 100, 100, 200))
@@ -320,8 +535,28 @@ class NeonPlayer(QWidget):
         controls_layout = QVBoxLayout(controls_container)
         
         # Progress (Fake logic for this demo, would need MP3 length polling)
-        # self.progress = QSlider(Qt.Orientation.Horizontal)
-        # controls_layout.addWidget(self.progress)
+        # Playback progress: elapsed / slider / total
+        progress_row = QHBoxLayout()
+        self.label_elapsed = QLabel("0:00")
+        self.label_elapsed.setFixedWidth(50)
+        progress_row.addWidget(self.label_elapsed)
+
+        self.progress_slider = QSlider(Qt.Orientation.Horizontal)
+        self.progress_slider.setRange(0, 100)
+        self.progress_slider.setValue(0)
+        self.progress_slider.setSingleStep(1)
+        progress_row.addWidget(self.progress_slider, stretch=1)
+
+        self.label_total = QLabel("0:00")
+        self.label_total.setFixedWidth(50)
+        progress_row.addWidget(self.label_total)
+
+        controls_layout.addLayout(progress_row)
+
+        # Internal state for tracking playback position and length
+        self.current_track_length = 0.0
+        self._current_play_offset = 0.0
+        self._seeking = False
         
         btns_layout = QHBoxLayout()
         self.btn_prev = QPushButton("⏮")
@@ -337,6 +572,15 @@ class NeonPlayer(QWidget):
             btns_layout.addWidget(b)
             
         controls_layout.addLayout(btns_layout)
+        # Crossfade control
+        xf_layout = QHBoxLayout()
+        xf_layout.addWidget(QLabel("Crossfade (ms)"))
+        self.crossfade_slider = QSlider(Qt.Orientation.Horizontal)
+        self.crossfade_slider.setRange(0, 5000)
+        self.crossfade_slider.setValue(0)
+        self.crossfade_slider.setFixedWidth(200)
+        xf_layout.addWidget(self.crossfade_slider)
+        controls_layout.addLayout(xf_layout)
         main_layout.addSpacing(20)
         main_layout.addWidget(controls_container)
 
@@ -373,7 +617,11 @@ class NeonPlayer(QWidget):
         self.volume_slider.setFixedWidth(150)
         
         ops_layout.addWidget(self.btn_load)
+        self.btn_add_folder = QPushButton("Add Folder")
+        ops_layout.addWidget(self.btn_add_folder)
         ops_layout.addWidget(self.btn_fullscreen)
+        self.btn_market = QPushButton("Marketplace")
+        ops_layout.addWidget(self.btn_market)
         ops_layout.addWidget(QLabel("Volume"))
         ops_layout.addWidget(self.volume_slider)
         ops_layout.addStretch()
@@ -391,6 +639,8 @@ class NeonPlayer(QWidget):
         
         # Connections
         self.btn_load.clicked.connect(self.load_files)
+        self.btn_add_folder.clicked.connect(self.load_folder)
+        self.btn_market.clicked.connect(self.open_marketplace)
         self.btn_play.clicked.connect(self.toggle_play)
         self.btn_prev.clicked.connect(self.prev_track)
         self.btn_next.clicked.connect(self.next_track)
@@ -403,11 +653,17 @@ class NeonPlayer(QWidget):
         self.playlist_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.playlist_widget.customContextMenuRequested.connect(self._on_playlist_context_menu)
         self.playlist_widget.installEventFilter(self)
+        # Keyboard handled via keyPressEvent (Delete, Ctrl+F)
         
         # Track end checker
         self.end_timer = QTimer(self)
         self.end_timer.timeout.connect(self.check_end)
         self.end_timer.start(500)
+
+        # Connect progress slider interactions
+        self.progress_slider.sliderPressed.connect(lambda: setattr(self, '_seeking', True))
+        self.progress_slider.sliderReleased.connect(self._on_progress_released)
+        self.progress_slider.sliderMoved.connect(self._on_progress_moved)
         
         # Animation handle for playlist resizing
         self._playlist_anim = None
@@ -504,10 +760,41 @@ class NeonPlayer(QWidget):
         if files:
             for f in files:
                 self.playlist.append(f)
-                self.playlist_widget.addItem(basename(f))
+                item = QListWidgetItem(basename(f))
+                self.playlist_widget.addItem(item)
             if self.current_index == -1:
                 self.current_index = 0
             # Adjust playlist height to fit new items (animated)
+            self._update_playlist_size(animated=True)
+            self._update_playlist_header()
+
+    def load_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder")
+        if folder:
+            exts = {'.mp3', '.wav', '.ogg'}
+            added = 0
+            for root, dirs, files in os.walk(folder):
+                for f in files:
+                    if Path(f).suffix.lower() in exts:
+                        full = os.path.join(root, f)
+                        self.playlist.append(full)
+                        self.playlist_widget.addItem(QListWidgetItem(basename(full)))
+                        added += 1
+            if self.current_index == -1 and self.playlist:
+                self.current_index = 0
+            if added:
+                self._update_playlist_size(animated=True)
+                self._update_playlist_header()
+
+    def open_marketplace(self):
+        dlg = MarketplaceDialog(self, on_download=self._on_marketplace_download)
+        dlg.exec()
+
+    def _on_marketplace_download(self, filepath, add_to_playlist=True):
+        # Called when marketplace finished download; optionally add to playlist
+        if add_to_playlist and filepath:
+            self.playlist.append(filepath)
+            self.playlist_widget.addItem(QListWidgetItem(basename(filepath)))
             self._update_playlist_size(animated=True)
             self._update_playlist_header()
 
@@ -515,8 +802,21 @@ class NeonPlayer(QWidget):
         if 0 <= index < len(self.playlist):
             path = self.playlist[index]
             try:
+                # If currently playing and crossfade is enabled, fade out
+                xf = getattr(self, 'crossfade_slider', None)
+                crossfade_ms = xf.value() if xf is not None else 0
+                if pygame.mixer.music.get_busy() and crossfade_ms > 0:
+                    try:
+                        pygame.mixer.music.fadeout(crossfade_ms)
+                    except Exception:
+                        pass
+
                 pygame.mixer.music.load(path)
-                pygame.mixer.music.play()
+                # Start with fade-in if crossfade_ms provided
+                if crossfade_ms > 0:
+                    pygame.mixer.music.play(fade_ms=crossfade_ms)
+                else:
+                    pygame.mixer.music.play()
                 self.playing = True
                 self.btn_play.setText("⏸ Pause")
                 self.visualizer.active = True
@@ -577,6 +877,32 @@ class NeonPlayer(QWidget):
         # Set target colors for animation
         self.target_color_1 = c1
         self.target_color_2 = c2
+        # Attempt to fetch track length (seconds)
+        length = 0.0
+        if MUTAGEN_AVAILABLE:
+            try:
+                f = MutagenFile(path)
+                if f and hasattr(f, 'info') and hasattr(f.info, 'length'):
+                    length = float(f.info.length)
+            except Exception:
+                length = 0.0
+
+        if length == 0.0:
+            try:
+                # Fallback to pygame Sound length (may be heavy)
+                snd = pygame.mixer.Sound(path)
+                length = float(snd.get_length())
+            except Exception:
+                length = 0.0
+
+        self.current_track_length = length
+        if length > 0:
+            self.progress_slider.setRange(0, int(math.ceil(length)))
+            self.label_total.setText(self._format_time(length))
+        else:
+            # unknown length
+            self.progress_slider.setRange(0, 100)
+            self.label_total.setText("0:00")
 
     def _set_placeholder_art(self):
         pix = QPixmap(300, 300)
@@ -587,6 +913,63 @@ class NeonPlayer(QWidget):
         painter.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "🎵")
         painter.end()
         self.album_art.setPixmap(pix)
+
+    def _format_time(self, seconds: float) -> str:
+        try:
+            s = int(seconds)
+            m = s // 60
+            ss = s % 60
+            return f"{m}:{ss:02d}"
+        except Exception:
+            return "0:00"
+
+    def _on_progress_moved(self, val):
+        # While moving the slider, show provisional elapsed time
+        if self.current_track_length > 0:
+            # slider range is seconds when known
+            secs = int(val)
+            self.label_elapsed.setText(self._format_time(secs))
+        else:
+            # treat as percent
+            pct = val / max(1, self.progress_slider.maximum())
+            self.label_elapsed.setText(self._format_time(pct * self.current_track_length))
+
+    def _on_progress_released(self):
+        self._seeking = False
+        val = self.progress_slider.value()
+        # Compute seek seconds
+        if self.current_track_length > 0:
+            secs = float(val)
+        else:
+            # percentage into unknown length -> no-op
+            secs = 0.0
+        self._seek_to(secs)
+
+    def _seek_to(self, seconds: float):
+        # Try to seek using pygame's set_pos or play(start=)
+        try:
+            # stop and play from new position
+            was_playing = self.playing
+            pygame.mixer.music.stop()
+            try:
+                pygame.mixer.music.play(start=seconds)
+            except TypeError:
+                # older pygame may not accept named param
+                pygame.mixer.music.play(0, seconds)
+            self._current_play_offset = seconds
+            if not was_playing:
+                pygame.mixer.music.pause()
+                self.playing = False
+            else:
+                self.playing = True
+            # update UI
+            self.label_elapsed.setText(self._format_time(seconds))
+        except Exception:
+            try:
+                pygame.mixer.music.set_pos(seconds)
+                self._current_play_offset = seconds
+            except Exception:
+                pass
 
     def _update_playlist_header(self):
         visible_count = sum(not self.playlist_widget.item(i).isHidden() for i in range(self.playlist_widget.count()))
@@ -658,6 +1041,19 @@ class NeonPlayer(QWidget):
                         pass
         return super().eventFilter(source, event)
 
+    def keyPressEvent(self, event):
+        # Handle Delete to remove selected, Ctrl+F to focus search
+        key = event.key()
+        mods = event.modifiers()
+        if key == Qt.Key.Key_Delete:
+            self._remove_selected()
+            return
+        # Ctrl+F
+        if mods & Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_F:
+            self.search_box.setFocus()
+            return
+        super().keyPressEvent(event)
+
     def toggle_play(self):
         if not self.playlist: return
         if self.playing:
@@ -709,6 +1105,27 @@ class NeonPlayer(QWidget):
         self.play_track(self.current_index)
 
     def check_end(self):
+        # Update progress display
+        try:
+            pos_ms = pygame.mixer.music.get_pos()
+        except Exception:
+            pos_ms = -1
+
+        if pos_ms >= 0:
+            elapsed = (pos_ms / 1000.0) + getattr(self, '_current_play_offset', 0.0)
+            if not self._seeking:
+                # update slider and label
+                if self.current_track_length > 0:
+                    # clamp
+                    if elapsed > self.current_track_length:
+                        elapsed = self.current_track_length
+                    self.progress_slider.setValue(int(elapsed))
+                else:
+                    # unknown length - update percent-like
+                    maxv = self.progress_slider.maximum()
+                    self.progress_slider.setValue(int((elapsed % 1) * maxv))
+                self.label_elapsed.setText(self._format_time(elapsed))
+
         if self.playing and not pygame.mixer.music.get_busy():
             # Track ended
             if self.loop:
